@@ -1,0 +1,5 @@
+/opt/hermes/.venv/bin/python - <<'PY'
+import json,subprocess
+from pathlib import Path
+D=Path('/opt/data/artifacts/toolbox-baseline-batch07-20261021/01');r=json.loads((D/'served-reads.json').read_text());a=r[0]['data'][0]['address'];urls=[['managed-logo',r[0]['data'][0]['logoURI']],['llama','https://coins.llama.fi/prices/current/ethereum:'+a],['coingecko','https://api.coingecko.com/api/v3/simple/token_price/ethereum?contract_addresses='+a+'&vs_currencies=usd&include_last_updated_at=true'],['identity','https://docs.euler.finance/build/contract-addresses/'],['eul','https://raw.githubusercontent.com/euler-xyz/euler-docs/master/eul/about.md'],['terms','https://www.euler.finance/terms'],['fee-flow','https://docs.euler.finance/EUL/fee-flow/']];(D/'public.json').write_text(json.dumps(urls));subprocess.run(['/opt/hermes/.venv/bin/python',str(D.parent/'fetch_public.py'),str(D),str(D/'public.json')],check=True)
+PY

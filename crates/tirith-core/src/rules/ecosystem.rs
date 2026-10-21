@@ -5,12 +5,68 @@ use crate::parse::UrlLike;
 use crate::util::levenshtein;
 use crate::verdict::{Evidence, Finding, RuleId, Severity};
 
-/// Run ecosystem-specific rules.
-pub fn check(url: &UrlLike) -> Vec<Finding> {
+/// Conservative command evidence for Python package sources. This is not a
+/// shell validator: quoted, wrapped, malformed and embedded invocations must
+/// not become an exemption merely because we cannot fully resolve them.
+#[derive(Clone, Copy)]
+pub struct PythonPackageContext {
+    package_source: bool,
+    ambiguous_install: bool,
+}
+
+static PYTHON_PACKAGE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9_])(?:pip(?:[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?|uv(?:\.exe)?)(?:$|[^a-z0-9_])|(?:^|\s)-mpip(?:$|\s)|(?:PIP|UV)_(?:EXTRA_)?INDEX(?:_URL)?\s*=|--(?:extra-)?index(?:-url)?(?:[=\s]|$)|--find-links(?:[=\s]|$)").unwrap()
+});
+static INSTALL_ACTION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(?:install|add|sync|download|wheel)\b").unwrap()
+});
+
+impl PythonPackageContext {
+    pub fn from_command(input: &str, urls: &[crate::extract::ExtractedUrl]) -> Self {
+        // URL paths, hosts and query values are operands, not installer evidence.
+        // Use the same extraction as the engine rather than a second URL grammar.
+        // Longest first handles a URL that is a prefix of another one. Keep
+        // expansions inside URLs conservative: they can contain executable code.
+        // Bare DockerRef names (e.g. "pip") are not URL literals: replacing them
+        // globally could erase a real installer token in a different segment.
+        let mut literals: Vec<&str> = urls
+            .iter()
+            .filter(|url| matches!(url.parsed, UrlLike::Standard { .. }))
+            .map(|url| url.raw.as_str())
+            .collect();
+        literals.sort_by_key(|raw| std::cmp::Reverse(raw.len()));
+        let mut command = input.to_string();
+        for raw in literals {
+            if !raw.is_empty() && !raw.contains(['$', '`']) {
+                command = command.replace(raw, " ");
+            }
+        }
+        // Keep both raw and a conservative dequoted spelling. This recognizes
+        // p''ip / pi\p / line continuations without evaluating any shell code.
+        // False positives on quoted installer examples are preferable to
+        // silently trusting an unresolved install. No hostname is exempted.
+        let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+        let dequoted: String = joined
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        Self {
+            package_source: PYTHON_PACKAGE_RE.is_match(&command)
+                || PYTHON_PACKAGE_RE.is_match(&dequoted),
+            // Preserve the old /simple/ signal for unresolved/dynamic installs.
+            // These hints do not classify unrelated non-/simple/ URLs as pip.
+            ambiguous_install: INSTALL_ACTION_RE.is_match(&dequoted)
+                || command.contains(['$', '`', '%']),
+        }
+    }
+}
+
+/// Run ecosystem-specific rules, retaining command context for package URLs.
+pub fn check(url: &UrlLike, python: PythonPackageContext) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     check_docker_untrusted_registry(url, &mut findings);
-    check_pip_url_install(url, &mut findings);
+    check_pip_url_install(url, python, &mut findings);
     check_npm_url_install(url, &mut findings);
     check_web3_rpc(url, &mut findings);
     check_web3_address_in_url(url, &mut findings);
@@ -55,9 +111,13 @@ fn check_docker_untrusted_registry(url: &UrlLike, findings: &mut Vec<Finding>) {
     }
 }
 
-fn check_pip_url_install(url: &UrlLike, findings: &mut Vec<Finding>) {
+fn check_pip_url_install(
+    url: &UrlLike,
+    context: PythonPackageContext,
+    findings: &mut Vec<Finding>,
+) {
     if let Some(path) = url.path() {
-        if path.contains("/simple/") {
+        if context.package_source || (context.ambiguous_install && path.contains("/simple/")) {
             if let Some(host) = url.host() {
                 if host != "pypi.org"
                     && host != "files.pythonhosted.org"
