@@ -2286,6 +2286,9 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
 
         extracted = extract::extract_urls(&analyzed_input, ctx.shell);
 
+        let python_package_context =
+            crate::rules::ecosystem::PythonPackageContext::from_command(&analyzed_input, &extracted);
+
         for url_info in &extracted {
             // url::Url percent-encodes non-ASCII on parse, so non-ASCII path rules
             // need the raw (pre-parse) path.
@@ -2306,7 +2309,8 @@ fn analyze_inner(ctx: &AnalysisContext) -> (Verdict, Policy) {
                 crate::rules::transport::check(&url_info.parsed, url_info.in_sink_context);
             findings.extend(transport_findings);
 
-            let ecosystem_findings = crate::rules::ecosystem::check(&url_info.parsed);
+            let ecosystem_findings =
+                crate::rules::ecosystem::check(&url_info.parsed, python_package_context);
             findings.extend(ecosystem_findings);
         }
 

